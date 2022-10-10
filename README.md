@@ -1,8 +1,8 @@
-# Pytorch Examples
+# EasyDistPLMs
 
 ## Introduction
 
-We provide a simple pytorch-based bert classification example with well-formed structure. You can simply build and run your fine-tuning task with tiny modification of the code.
+We provide a simple pytorch-based PLM finetuning example with well-formed structure. You can simply build and run your fine-tuning task with tiny modification of the code.
 
 ## Requirements
 
