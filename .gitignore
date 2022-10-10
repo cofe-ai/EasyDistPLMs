@@ -4,3 +4,6 @@ ckpts/*
 logs/*
 data/*
 wandb/*
+.idea/*
+*.log
+.vscode/*
