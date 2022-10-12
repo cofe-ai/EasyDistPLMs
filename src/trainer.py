@@ -2,103 +2,132 @@
 from src.dataloaders import init_dataloader
 from src.datasets import SNLIDataset, IMDBDataset, LabelMap
 from src.model import BertCLSModel
-from src.utils import \
-    init_distributed, pin_gpu_to_process, wrap_hvd_optimizer, get_world_size, \
-    broadcast_model_params, setup_gradient_scaler, metric_average, LogMessage
-import horovod.torch as hvd
+from src.utils import LogMessage, torch_distributed_master_process_first, get_ds_config
 import torch
+import deepspeed
 from transformers import AutoTokenizer
 from transformers.optimization import get_linear_schedule_with_warmup
 from filelock import FileLock
 from tqdm import tqdm
+from sklearn.metrics import accuracy_score
 import os
 import random
 import wandb
 import logging
 
-
-
 class Trainer:
     def __init__(self, args):
+        self.ds_config = get_ds_config(args.deepspeed_config)
         self.timestamp = args.timestamp
         self.fix_seed(args.seed)
-        self.device = None
-        self.is_distributed = False
-        self.use_amp = args.amp
-        self.use_adasum = args.adasum
-        assert not (self.use_amp and self.use_adasum), "amp and adasum cannot be used together"
-        self.setup_device(use_horovod=args.horovod)  # also setup is_distributed and device attr
+        deepspeed.init_distributed()
+        self.is_distributed = (args.local_rank != -1)
         self.log_info_message = LogMessage(self.is_distributed)
+        self.log_info_message(f"distributed enabled: {self.is_distributed}")
         self.label_map = LabelMap(args.label_path)
         self.tokenizer = AutoTokenizer.from_pretrained(args.pretrained)
-        self.model = BertCLSModel(pretrained_path=args.pretrained,
-                                  num_labels=self.label_map.num_labels,
-                                  dropout_prob=args.dropout,
-                                  pooler_type=args.pooler_type)
-
-        if torch.cuda.is_available():
-            self.model.cuda()
-        self.batch_size = args.batch_size
-        self.shuffle_train_data = args.shuffle
-        self.max_seq_len = args.max_seq_len
+        self.max_epochs = args.max_epochs
+        self.patience = args.patience
         self.train_loader, self.valid_loader = self.prepare_data(train_path=args.train_path,
                                                                  valid_path=args.valid_path,
                                                                  pre_tokenized=args.pre_tokenized,
+                                                                 shuffle_train_data=args.shuffle,
                                                                  num_workers=args.num_data_workers,
+                                                                 max_seq_len=args.max_seq_len,
+                                                                 batch_size=self.ds_config["train_micro_batch_size_per_gpu"],
                                                                  save_cache=args.save_cache,
                                                                  use_cache=args.use_cache)
-
-        self.ckpt_path = os.path.join(args.ckpt_path, self.timestamp)
-        with FileLock(os.path.expanduser("~/.horovod_lock")):
-            if not os.path.exists(self.ckpt_path):
-                os.makedirs(self.ckpt_path)
-        self.max_epochs = args.max_epochs
-        self.patience = args.patience
+        self.model, self.optimizer, self.lr_scheduler = self.setup_model_optimizer_and_scheduler(args)
+        self.device = self.setup_device(args.local_rank)
         self.log_interval = args.log_interval
-        self.lr = args.lr
-        self.scale_lr = not args.no_scale_lr
-        self.weight_decay = args.weight_decay
-        self.optimizer = self.init_optimizer()
-        self.lr_scheduler = self.init_scheduler()
-        self.best_metric = 0.0
-        self.best_epoch = 0
+
         self.use_wandb = args.use_wandb
         if self.use_wandb:
             os.environ["WANDB_API_KEY"] = args.wandb_key
             wandb.init(project=args.task_name, group="torch")
+        self.ckpt_path = os.path.join(args.ckpt_path, self.timestamp)
+        with FileLock(os.path.expanduser("~/.deepspeed_lock")):
+            if not os.path.exists(self.ckpt_path):
+                os.makedirs(self.ckpt_path)
+        self.best_metric = 0.0
+        self.best_epoch = 0
 
-    def setup_device(self, use_horovod: bool):
-        self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        if torch.cuda.is_available() and use_horovod:
-            if torch.cuda.is_available() and use_horovod:
-                self.is_distributed = True
-            logging.info("use horovod for distributed training")
-            init_distributed()
-            pin_gpu_to_process()
+
+    def setup_device(self, local_rank):
+        if torch.cuda.is_available():
+            if torch.distributed.is_initialized():
+                device = torch.device("cuda", local_rank)
+            else:
+                device = torch.device("cuda")
         else:
-            self.is_distributed = False
+            device = torch.device("cpu")
+        logging.info(f"setup device: {device}")
+        return device
 
     def fix_seed(self, seed):
         torch.manual_seed(seed)
-        torch.backends.cudnn.enabled = False
+        torch.backends.cudnn.enabled = True
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
         random.seed(seed)
+
+    def setup_model_optimizer_and_scheduler(self, args):
+        model = BertCLSModel(pretrained_path=args.pretrained,
+                             num_labels=self.label_map.num_labels,
+                             dropout_prob=args.dropout,
+                             pooler_type=args.pooler_type)
+        grouped_model_params = self.group_optim_params(model, weight_decay=args.weight_decay)
+        model_engine, optimizer, _, _ = deepspeed.initialize(args=args,
+                                                             model=model,
+                                                             model_parameters=grouped_model_params)
+        lr_scheduler = self.init_scheduler(optimizer=optimizer,
+                                           num_steps_per_epoch=len(self.train_loader),
+                                           warmup_ratio=args.warmup)
+        return model_engine, optimizer, lr_scheduler
+
+    def group_optim_params(self, model, weight_decay):
+        no_decay = ["bias", "LayerNorm.bias", "LayerNorm.weight"]
+        optimizer_grouped_parameters = [
+            {
+                "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        return optimizer_grouped_parameters
+
+    def init_scheduler(self, optimizer, num_steps_per_epoch, warmup_ratio):
+        total_train_steps = num_steps_per_epoch * self.max_epochs
+        lr_scheduler = get_linear_schedule_with_warmup(
+            optimizer=optimizer,
+            num_warmup_steps=total_train_steps * warmup_ratio,
+            num_training_steps=total_train_steps,
+        )
+        self.log_info_message("setup lr_scheduler")
+        return lr_scheduler
+
 
     def prepare_data(self,
                      train_path: str,
                      valid_path: str,
                      pre_tokenized: bool,
+                     shuffle_train_data: bool,
                      num_workers: int,
+                     max_seq_len: int,
+                     batch_size: int,
                      save_cache: bool,
-                     use_cache: bool):
+                     use_cache: bool
+                     ):
         train_set = IMDBDataset(data_type="train", path=train_path, label_map=self.label_map,
                                 tokenizer=self.tokenizer, pre_tokenize=pre_tokenized,
-                                max_seq_len=self.max_seq_len, save_cache=save_cache, use_cache=use_cache)
+                                max_seq_len=max_seq_len, save_cache=save_cache, use_cache=use_cache)
 
         train_loader = init_dataloader(dataset=train_set,
-                                       shuffle=True,
-                                       batch_size=self.batch_size,
+                                       shuffle=shuffle_train_data,
+                                       batch_size=batch_size,
                                        input_pad_id=self.tokenizer.pad_token_id,
                                        num_workers=num_workers,
                                        is_distributed=self.is_distributed
@@ -107,61 +136,21 @@ class Trainer:
         if valid_path is not None:
             valid_set = IMDBDataset(data_type="valid", path=valid_path, label_map=self.label_map,
                                     tokenizer=self.tokenizer, pre_tokenize=pre_tokenized,
-                                    max_seq_len=self.max_seq_len, save_cache=save_cache, use_cache=use_cache)
+                                    max_seq_len=max_seq_len, save_cache=save_cache, use_cache=use_cache)
 
             valid_loader = init_dataloader(dataset=valid_set,
                                            shuffle=False,
-                                           batch_size=self.batch_size,
+                                           batch_size=batch_size,
                                            input_pad_id=self.tokenizer.pad_token_id,
                                            num_workers=0,  # disable multiprocessing on valid set data loading
                                            is_distributed=self.is_distributed
                                            )
         return train_loader, valid_loader
 
-    def init_optimizer(self):
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": self.weight_decay,
-            },
-            {
-                "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
-                "weight_decay": 0.0,
-            },
-        ]
-        # effective batch size is scaled by the num of hvd process
-        if self.is_distributed:
-            # If using GPU Adasum allreduce, scale learning rate by local_size.
-            if self.use_adasum:
-                scale_factor = hvd.local_size()
-            elif self.scale_lr:
-                scale_factor = get_world_size()
-            else:
-                scale_factor = 1
-
-            self.lr *= scale_factor
-            self.log_info_message(f"scale lr to {self.lr} with scale factor: {scale_factor}")
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=self.lr)
-        if self.is_distributed:
-            optimizer = wrap_hvd_optimizer(optimizer, self.model.named_parameters(), self.use_adasum)
-            self.log_info_message("wrap optimizer with horovod")
-        return optimizer
-
-    def init_scheduler(self):
-        total_train_steps = len(self.train_loader) * self.max_epochs
-        lr_scheduler = get_linear_schedule_with_warmup(
-            optimizer=self.optimizer,
-            num_warmup_steps=total_train_steps * 0.1,
-            num_training_steps=total_train_steps,
-        )
-        self.log_info_message("setup lr_scheduler")
-        return lr_scheduler
 
     def eval(self):
         total_preds = []
         total_golds = []
-        acc = 0.
         total_loss = 0.
         with torch.no_grad():
             for batch in self.valid_loader:
@@ -170,36 +159,31 @@ class Trainer:
                 loss, logits = self.model(batch)
                 batch_golds = batch["label"].cpu()
                 batch_preds = torch.argmax(logits.cpu(), dim=-1)
-                acc += batch_preds.eq(batch_golds).float().sum()
                 total_golds.extend(batch_golds.tolist())
                 total_preds.extend(batch_preds.tolist())
                 total_loss += loss.item()
         # use sampler to determine the number of examples in this worker's partition.
-        acc /= len(self.valid_loader.sampler)
         total_loss /= len(self.valid_loader.sampler)
-        # use allreduce to get average metrics
-        if self.is_distributed:
-            total_loss = metric_average(total_loss, 'avg_loss')
-            acc = metric_average(acc, 'avg_accuracy')
+        acc = accuracy_score(total_golds, total_preds)
         return acc, total_loss
 
-    @staticmethod
-    def batch2cuda(batch, ignore_keys=["uuid"]):
+    def update_metrics(self, valid_acc, epoch):
+        if epoch == 0 or epoch != self.best_epoch:
+            if self.best_metric < valid_acc:
+                self.best_metric = valid_acc
+                self.best_epoch = epoch
+
+    def batch2cuda(self, batch, ignore_keys=["uuid"]):
         for k, v in batch.items():
             if k in ignore_keys:
                 continue
-            batch[k] = v.cuda()
+            batch[k] = v.to(self.device)
 
     def save_ckpt(self):
         torch.save(self.model.state_dict(), os.path.join(self.ckpt_path, "best.ckpt"))
         logging.info(f"successfully saved ckpt to {self.ckpt_path}")
 
     def train(self):
-        if self.is_distributed:
-            broadcast_model_params(model=self.model, optimizer=self.optimizer)
-            logging.info(f"broadcast model params to rank {hvd.rank()}")
-        if self.use_amp:
-            grad_scaler = setup_gradient_scaler()
 
         current_step = 0
         no_improve = 0
@@ -216,47 +200,29 @@ class Trainer:
             for batch in self.train_loader:
                 if torch.cuda.is_available():
                     self.batch2cuda(batch, ignore_keys=["uuid"])
-                self.optimizer.zero_grad()
-                if self.use_amp:
-                    with torch.cuda.amp.autocast():
-                        loss, logits = self.model(batch)
-                else:
-                    loss, logits = self.model(batch)
-                # Each parameter’s gradient (.grad attribute) should be unscaled
-                # before the optimizer updates the parameters,
-                # so the scale factor does not interfere with the learning rate.
-                if self.use_amp:
-                    grad_scaler.scale(loss).backward()
-                    if self.is_distributed:
-                        self.optimizer.synchronize()
-                    # In-place unscaling of all gradients before weights update
-                    grad_scaler.unscale_(self.optimizer)
-                    if self.is_distributed:
-                        with self.optimizer.skip_synchronize():
-                            grad_scaler.step(self.optimizer)
-                    else:
-                        grad_scaler.step(self.optimizer)
-                    # Update scaler in case of overflow/underflow
-                    grad_scaler.update()
-                else:
-                    loss.backward()
-                    self.optimizer.step()
-                self.lr_scheduler.step()
-                current_step += 1
+                loss, logits = self.model(batch)
+                self.model.backward(loss)
+                self.model.step()
+                if self.model.is_gradient_accumulation_boundary():
+                    self.lr_scheduler.step()
+
                 loss = loss.detach().item()
                 current_lr = self.lr_scheduler.get_last_lr()[0]
-                if current_step % self.log_interval == 0 or current_step % num_steps_one_epoch == 0:
 
-                    update_steps = self.log_interval
-                    if current_step % num_steps_one_epoch == 0:
-                        update_steps = current_step % self.log_interval
-                        if update_steps == 0:
-                            update_steps = self.log_interval
 
-                    if self.use_wandb:
-                        wandb.log({"loss": loss, "lr": current_lr})
+                if self.use_wandb:
+                    wandb.log({"loss": loss, "lr": current_lr})
+                # logging on rank 0
+                if (self.is_distributed and torch.distributed.get_rank() == 0) or not self.is_distributed:
+                    current_step += 1
+                    if current_step % self.log_interval == 0 or current_step % num_steps_one_epoch == 0:
 
-                    if (self.is_distributed and hvd.rank() == 0) or not self.is_distributed:
+                        update_steps = self.log_interval
+                        if current_step % num_steps_one_epoch == 0:
+                            update_steps = current_step % self.log_interval
+                            if update_steps == 0:
+                                update_steps = self.log_interval
+
                         logging.info(f"step {current_step}, current loss: {loss}, current_lr: {current_lr}")
                         pbar.update(update_steps)
 
@@ -264,23 +230,23 @@ class Trainer:
             self.log_info_message(f"epoch {epoch} training finished.")
             self.model.eval()
             valid_acc, valid_loss = self.eval()
+
             if self.use_wandb:
                 wandb.log({"valid_loss": loss, "valid_acc": valid_acc})
-            if self.best_metric < valid_acc:
-                self.best_metric = valid_acc
-                self.best_epoch = epoch
+            if self.is_distributed:
+                with torch_distributed_master_process_first(torch.distributed.get_rank()):
+                    self.update_metrics(valid_acc, epoch)
+            else:
+                self.update_metrics(valid_acc, epoch)
 
-                # save ckpt on rank 0 only
-                if self.is_distributed and hvd.rank() != 0:
-                    continue
-                else:
-                    self.save_ckpt()
+            # save best epoch
+            if self.best_epoch == epoch:
+                self.save_ckpt()
 
                 no_improve = 0
             else:
                 no_improve += 1
                 if no_improve >= self.patience:
-
                     self.log_info_message(f"no improve within {no_improve} epochs, early stop")
                     break
 

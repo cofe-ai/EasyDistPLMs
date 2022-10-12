@@ -1,6 +1,6 @@
 # -*- coding:UTF-8 -*-
 from argparse import ArgumentParser
-
+import deepspeed
 
 def get_args(mode="train"):
     parser = ArgumentParser()
@@ -12,6 +12,10 @@ def get_args(mode="train"):
         get_inference_args(parser)
     else:
         raise NotImplementedError
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='local rank passed from distributed launcher')
+    # Include DeepSpeed configuration arguments
+    parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
 
@@ -23,7 +27,6 @@ def get_common_args(parser):
     parser.add_argument("--label-path", type=str, required=True, help="labelspace, each line contains one unique label")
     parser.add_argument("--pretrained", type=str, required=True, help="pretrained models on huggginface transformers' model hub")
     parser.add_argument("--pooler-type", type=str, required=True, help="choose mean pooler or original cls pooler")
-    parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--pre-tokenized", action="store_true", help="if true, input text will be splitted by space first, then tokenize(slower speed)")
     parser.add_argument("--save-cache", action="store_true", help="save/overwrite data cache")
@@ -31,18 +34,14 @@ def get_common_args(parser):
     parser.add_argument("--log-interval", default=10, type=int)
 
 def get_train_args(parser):
-    parser.add_argument("--horovod", action="store_true", help="use horovod for distributed training")
-    parser.add_argument("--amp", action="store_true", help="use Automatic Mixed Precision")
-    parser.add_argument("--adasum", action="store_true", help="use adasum algorithm when distributed, note that this is against no-scale-lr")
     parser.add_argument("--train-path", type=str, required=True)
     parser.add_argument("--valid-path", type=str)
     parser.add_argument("--num-data-workers", type=int, default=0, help="use N workers to load data with multiprocessing")
     parser.add_argument("--ckpt-path", type=str, required=True, help="dir to save ckpts")
     parser.add_argument("--max-epochs", type=int, required=True, help="max epoches to train")
     parser.add_argument("--patience", type=int, required=True, help="if no improve counts exceeds patience, trigger early stop")
-    parser.add_argument("--lr", type=float, default=1e-5)
-    parser.add_argument("--no-scale-lr", action="store_true", help="don't scale up lr by world_size")
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup", type=float, default=0.1)
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--shuffle", action="store_true", help="shuffle train data")
     parser.add_argument("--use-wandb", action="store_true")

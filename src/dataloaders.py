@@ -81,11 +81,8 @@ def init_dataloader(dataset, shuffle: bool, batch_size: int, input_pad_id: int, 
 
 def init_sampler(dataset, shuffle: bool, is_distributed: bool):
     if is_distributed:
-        import horovod.torch as hvd
         sampler = DistributedSampler(dataset=dataset,
                                      shuffle=shuffle,
-                                     num_replicas=hvd.size(),
-                                     rank=hvd.rank(),
                                      drop_last=True)
     else:
         sampler = None

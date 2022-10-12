@@ -1,49 +1,32 @@
 # -*- coding:UTF-8 -*-
 import torch
-import horovod.torch as hvd
 import logging
+import deepspeed
+import torch.distributed as dist
+from contextlib import contextmanager
+import json
 
-
-def init_distributed():
-    hvd.init()
-
-
-def pin_gpu_to_process():
-    if torch.cuda.is_available():
-        torch.cuda.set_device(hvd.local_rank())
-
-
-def wrap_hvd_optimizer(optimizer, named_params, use_adasum):
-    optimizer = hvd.DistributedOptimizer(optimizer,
-                                         named_parameters=named_params,
-                                         op=hvd.Adasum if use_adasum else hvd.Average)
-    return optimizer
-
-
-def broadcast_model_params(model, optimizer):
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
-
-def get_world_size():
-    return hvd.size()
-
-
-def metric_average(val, name):
-    tensor = torch.tensor(val)
-    avg_tensor = hvd.allreduce(tensor, name=name)
-    return avg_tensor.item()
-
-
-def setup_gradient_scaler():
-    scaler = torch.cuda.amp.GradScaler()
-    return scaler
-
+def get_ds_config(config_path):
+    with open(config_path, "r", encoding="utf8") as fr:
+        data = json.load(fr)
+    return data
 
 class LogMessage:
     def __init__(self, is_distributed):
         self.is_distributed = is_distributed
 
     def __call__(self, message):
-        if (self.is_distributed and hvd.rank() == 0) or not self.is_distributed:
+        if (self.is_distributed and dist.get_rank() == 0) or not self.is_distributed:
             logging.info(message)
+
+
+@contextmanager
+def torch_distributed_master_process_first(rank: int):
+    """
+    Decorator to make all processes in distributed training wait for each master to do something.
+    """
+    if rank not in [-1, 0]:
+        torch.distributed.barrier()
+    yield
+    if rank == 0:
+        torch.distributed.barrier()

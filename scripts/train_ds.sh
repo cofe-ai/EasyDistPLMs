@@ -1,21 +1,22 @@
 #!/bin/bash
+
 WANDB_KEY=$WANDB_KEY # paste your key here if wandb is enabled
 TIMESTAMP=$(date +'%Y-%m-%d-%H-%M')
 HOSTFILE="./hostfile"
 LOGDIR="logs"
+NUM_NODES=2
+NUM_GPUS_PER_NODE=2
 TASK_NAME="imdb-cls"
 mkdir -p $LOGDIR
 
-NCCL_ENVS="NCCL_DEBUG=info"
-
 OPTIONS="
---amp \
+--deepspeed \
+--deepspeed_config ds_config.json \
 --task-name $TASK_NAME \
 --timestamp $TIMESTAMP \
 --label-path config/labelspace_imdb \
 --pretrained ../pretrained_models/bert-base-uncased \
 --pooler-type cls \
---batch-size 256 \
 --save-cache \
 --use-cache \
 --train-path data/imdb/train.csv \
@@ -24,8 +25,7 @@ OPTIONS="
 --ckpt-path ckpts \
 --max-epochs 3 \
 --patience 3 \
---lr 4e-5 \
---no-scale-lr \
+--warmup 0.1 \
 --dropout 0.1 \
 --shuffle \
 --max-seq-len 128 \
@@ -33,7 +33,8 @@ OPTIONS="
 "
 
 RUN_CMD="${NCCL_ENVS} \
-python -u run.py \
+deepspeed --hostfile $HOSTFILE --num_nodes $NUM_NODES --num_gpus $NUM_GPUS_PER_NODE \
+run.py \
 $OPTIONS \
 2>&1 | tee ${LOGDIR}/${TASK_NAME}-${TIMESTAMP}.log"
 

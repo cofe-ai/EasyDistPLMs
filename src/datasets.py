@@ -10,6 +10,7 @@ import numpy as np
 import pyarrow as pa
 import pandas as pd
 from tqdm import tqdm
+from filelock import FileLock
 
 def print_examples(data, k=3):
     for example in random.sample(data, k=k):
@@ -116,12 +117,13 @@ class SeqCLSDataset(Dataset):
                 data.append(data_i)
             logging.info(f"num samples: {self.num_samples}, max len in dataset: {max_len_in_data}")
         if self.save_cache:
-            if not os.path.exists(pkl_path):
-                with FileLock(os.path.expanduser("~/.horovod_lock")):
-                    with open(pkl_path, "wb") as fw:
-                        fw.write(pkl.dumps(data))
-            else:
+            if os.path.exists(pkl_path):
                 logging.info("try to save dataset but pkl exists! ignore...")
+            else:
+                with FileLock(os.path.expanduser("~/.deepspeed_lock")):
+                    if not os.path.exists(pkl_path):
+                        with open(pkl_path, "wb") as fw:
+                            fw.write(pkl.dumps(data))
         return data
 
 
