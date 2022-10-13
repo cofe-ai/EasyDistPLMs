@@ -3,6 +3,7 @@
 ## Introduction
 
 We provide a simple pytorch-based PLM finetuning example with well-formed structure. You can simply build and run your fine-tuning task with tiny modification of the code.
+Meanwhile, we provide different distributed-training approaches with little change of the original code. You can checkout deepspeed / horovod branch to try it yourself.
 
 ## Requirements
 
